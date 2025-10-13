@@ -18,7 +18,7 @@ from matplotlib.figure import Figure
 # -----------------------
 
 def encontrar_puerto_arduino():
-    puertos = serial.tools.list_ports.comports()                                                            #¿Qué pasa aquí?: La variable "puertos" utilizará la función para establecer una comunicación serial y buscará el puerto al que el Arduino este asociado 
+    puertos = serial.tools.list_ports.comports()                                                            #.¿Qué pasa aquí?: La variable "puertos" utilizará la función para establecer una comunicación serial y buscará el puerto al que el Arduino este asociado 
     for p in puertos:
         if "Arduino" in p.description or "ttyACM" in p.device or "ttyUSB" in p.device:
             return p.device                                                                                 #¿Qué pasa aquí?: Después de p repeticiones, cuando detecte las palabras clave entre comillas "" en algún puerto, entonces regresará el valor de p
