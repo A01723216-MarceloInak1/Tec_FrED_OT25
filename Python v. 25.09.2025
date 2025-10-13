@@ -18,19 +18,19 @@ from matplotlib.figure import Figure
 # -----------------------
 
 def encontrar_puerto_arduino():
-    puertos = serial.tools.list_ports.comports()
+    puertos = serial.tools.list_ports.comports()                                                            #¿Qué pasa aquí?: La variable "puertos" utilizará la función para establecer una comunicación serial y buscará el puerto al que el Arduino este asociado 
     for p in puertos:
         if "Arduino" in p.description or "ttyACM" in p.device or "ttyUSB" in p.device:
-            return p.device
+            return p.device                                                                                 #¿Qué pasa aquí?: Después de p repeticiones, cuando detecte las palabras clave entre comillas "" en algún puerto, entonces regresará el valor de p
     return None
 
-puerto = encontrar_puerto_arduino() or "/dev/ttyACM0"
+puerto = encontrar_puerto_arduino() or "/dev/ttyACM0"                                                       #¿Qué pasa aquí?: establece la variable "puerto" para cumplir la función "encontrar_puerto_arduino()" y devuelve el primero que parezca un Arduino (por descripción o nombre). 
 arduino = serial.Serial(puerto, 115200, timeout=1)
 
 # -----------------------
 # PlotCanvas: contenedor de gráficas
 # -----------------------
-class PlotCanvas(FigureCanvas):
+class PlotCanvas(FigureCanvas):                                                                             #¿Qué pasa aquí?: La clase funciona para reusar variables previamente establecidas pero con distintos parametros, por lo que crea el espacio para cada actuador (spool, abanico, hotend, etc.) y su grafica. 
     def __init__(self, parent=None, width=5, height=2, dpi=100):
         fig = Figure(figsize=(width, height), dpi=dpi)
         self.axes = fig.add_subplot(111)
@@ -48,13 +48,13 @@ class PlotCanvas(FigureCanvas):
 # -----------------------
 # GUI principal
 # -----------------------
-class ControlGUI(QWidget):
+class ControlGUI(QWidget):                                                                                  #¿Qué pasa aquí?: se crea el Interfaz de Usuario Grafico que manipularás para verificar el funcionamiento de los actuadores.
     def __init__(self):
         super().__init__()
         self.setWindowTitle("AI-FrED0 Control Interface")
         self.resize(1100, 700)
 
-        # Estados y datos
+        # Estados y datos                                                                                  #¿Qué pasa aquí?: El estado de cada actuador comenzará en 0 "(LOW)" y cuando se seleccione el boton de un actuador cambiará a estado 1. Cada self data son los datos recopilados del puerto hacia el interfaz.
         self.estado = ['0','0','0','0']
         self.velocidad_extrusor = 100
         self.temperatura_objetivo = 190  # <--- NUEVO
@@ -153,12 +153,12 @@ class ControlGUI(QWidget):
     #------------------------------------------------
     # Funciones de control
     #------------------------------------------------
-    def toggle(self, index, boton, nombre):
+    def toggle(self, index, boton, nombre):                                                            #¿Qué pasa aquí?: Cambia "self.estado[index]" entre '0' y '1' y actualiza el texto del botón. 
         self.estado[index] = '1' if self.estado[index]=='0' else '0'
         estado_txt = "ON" if self.estado[index]=='1' else "OFF"
         boton.setText(f"{nombre} ({estado_txt})")
 
-    def actualizar_velocidad(self, val):
+    def actualizar_velocidad(self, val):                                                               #¿Qué pasa aquí?: Actualiza el valor de velocidad se despliegue cuando se mueve el slider, el de temp funciona igual.
         self.velocidad_extrusor = val
         self.lbl_slider.setText(f"Velocidad Extrusor: {val}")
 
@@ -170,7 +170,7 @@ class ControlGUI(QWidget):
     #------------------------------------------------
     # Loop de comunicación y gráfica
     #------------------------------------------------
-    def actualizar(self):
+    def actualizar(self):                                                                              #¿Qué pasa aquí?: Cada tick (del timer) manda los datos al Arduino por serial
         # mandar comandos al Arduino, Añadiendo el nuevo comando de temperatura
         cmd_act = "ACTUATE:" + ''.join(self.estado) + "\n"
         arduino.write(cmd_act.encode())
@@ -182,7 +182,7 @@ class ControlGUI(QWidget):
         arduino.write(cmd_temp.encode())
 
         while arduino.in_waiting:
-            line = arduino.readline().decode(errors='ignore').strip()
+            line = arduino.readline().decode(errors='ignore').strip()                                #¿Qué pasa aquí?: lee lineas dentro del codigo de Arduino y si cumple con los requisitos, cambia de estado 0/1 en temperatura y los otros actuadores.
             if line.startswith("Temp:"):
                 try:
                     t = float(line.split(':')[1])
@@ -244,7 +244,7 @@ class ControlGUI(QWidget):
     #------------------------------------------------
     # Video
     #------------------------------------------------
-    def open_video(self):
+    def open_video(self):                                                                            #¿Qué pasa aquí?: deberia de abrir un video con los datos cambiandose pero no es seguro si funcione en este momento.
         path, _ = QFileDialog.getOpenFileName(self, "Abrir video", "", "Videos (*.mp4 *.avi *.mov)")
         if path:
             self.player.setMedia(QMediaContent(QUrl.fromLocalFile(path)))
@@ -258,7 +258,7 @@ class ControlGUI(QWidget):
 # -----------------------
 # Inicio de la aplicación
 # -----------------------
-def main():
+def main():                                                                                          #¿Qué pasa aquí?: Esta función hace que corra todo el interfaz, inicializando su logica y estructura (QApplication), se solicita el interfaz y se muestra en la pantalla para acceder a la información.
     app = QApplication(sys.argv)
     gui = ControlGUI()
     gui.show()
