@@ -1,0 +1,464 @@
+import sys
+import serial                      
+import serial.tools.list_ports      
+import numpy as np
+import math
+import cv2
+import os
+from datetime import datetime
+from collections import deque
+from PyQt5.QtWidgets import (
+    QApplication, QWidget, QPushButton, QVBoxLayout, QHBoxLayout,
+    QLabel, QSlider, QFileDialog
+)
+from PyQt5.QtCore import Qt, QTimer, QUrl, QThread
+from PyQt5.QtGui import QIcon, QPixmap, QImage
+from PyQt5.QtMultimedia import QMediaPlayer, QMediaContent
+from PyQt5.QtMultimediaWidgets import QVideoWidget
+from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.figure import Figure
+
+# -----------------------
+# Serial: auto-detect puerto 
+# -----------------------
+
+def encontrar_puerto_arduino():
+    puertos = serial.tools.list_ports.comports()
+    for p in puertos:
+        if "Arduino" in p.description or "ttyACM" in p.device or "ttyUSB" in p.device:
+            return p.device
+    return None
+
+puerto = encontrar_puerto_arduino() or "/dev/ttyACM0"
+arduino = serial.Serial("COM3", 115200, timeout=1)
+
+# -----------------------
+# PlotCanvas
+# -----------------------
+class PlotCanvas(FigureCanvas):
+    def __init__(self, parent=None, width=5, height=2, dpi=100, ylabel=""):
+        fig = Figure(figsize=(width, height), dpi=dpi)
+        ax = fig.add_subplot(111)
+        super().__init__(fig)
+        self.setParent(parent)
+        
+# -------------------------- INICIO DE CAMBIOS POR MEMO ----------------------------------
+
+# --------------- Definicion dimensiones de ventana de video -------------------
+        ax.grid(True, linewidth=0.5)
+        ax.set_ylabel(ylabel)
+        ax.set_xlim(0, 1)
+        ax.set_ylim(0, 1)
+
+        self.ax = ax # <- Facilita llamado de funciones para imagenes
+        (self._line,) = self.ax.plot([], [], linestyle='-') # <- Crea una linea que se reemplazara con fotos
+        self._max_points = 100  
+
+        fig.tight_layout() # <- Ajustar tamaño de la imagen
+
+    def set_max_points(self, n: int):
+        self._max_points = max(1, int(n)) # <- Ciclo de refresh de imagen
+
+    def update(self, data):
+        if data is None:
+            return
+
+        y = list(data)[-self._max_points:]
+        x = list(range(len(y)))
+
+        self._line.set_data(x, y)
+
+# ------------ Ubicacion de Widget en Interfaz --------------
+        if y:
+            xmin, xmax = 0, max(1, len(y) - 1)
+            ymin, ymax = min(y), max(y)
+            if ymin == ymax:
+                ymin -= 1e-6
+                ymax += 1e-6
+            span_y = ymax - ymin
+            pad = 0.05 * span_y
+            self.ax.set_xlim(xmin, xmax)
+            self.ax.set_ylim(ymin - pad, ymax + pad)
+
+        self.draw_idle()
+
+    def plot(self, data, ylabel=""):
+        self.axes.cla()
+        self.axes.plot(data, linestyle='-')  # siempre línea continua
+        if ylabel:
+            self.axes.set_ylabel(ylabel)
+        self.axes.grid(True)
+        self.draw()
+
+# ----------------------------------------------------------------------------------------------
+
+# -----------------------
+# GUI principal
+# -----------------------
+class ControlGUI(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("AI-FrED0 Control Interface")
+        self.resize(1100, 700)
+
+        # Estados y datos
+        self.estado = ['0','0','0','0']
+        self.velocidad_extrusor = 100
+        self.temperatura_objetivo = 190  # <--- NUEVO
+        self.temp_data     = []
+        self.motor_data    = []
+        self.fan_data      = []
+        self.extruder_data = []
+        self.FACTOR_CONVERSION = 0.25 / 43 
+        self.VALOR_UMBRAL = 127          
+
+# ----------------------- CONTINUACION CAMBIOS DE MEMO -----------------------------
+
+# ------------ Log de anomalias en el diametro de extrusion --------------------
+
+        self.DIAMETRO_MAX_MM = 1.000  # <- Valor para definir anomalia
+        self.buffer_size = 10 # <- Numero maximo de fotos en existencia
+        self.buffer_frames = deque(maxlen=self.buffer_size)  
+        self.buffer_dir = "buffer_camara"   # <- Carpeta de guardado de fotos
+        os.makedirs(self.buffer_dir, exist_ok=True) # <- Creacion de carpeta
+        self.buffer_index = 1  # <- Nombramiento de fotos del log del 1-10
+
+        # Estado de captura de anomalía 
+        self.anomalia_en_curso = False
+        self.anomalia_post_restantes = 0
+        self.anomalia_dir = None
+
+# --------------------------------------------------------------------------------
+
+        # Layout principal
+        main_layout = QHBoxLayout(self)
+
+        # --- Panel de gráficas ---
+        left_widget = QWidget()
+        left_layout = QVBoxLayout(left_widget)
+        self.canvas_temp     = PlotCanvas(self, width=5, height=2)
+        self.canvas_motor    = PlotCanvas(self, width=5, height=2)
+        self.canvas_fan      = PlotCanvas(self, width=5, height=2)
+        self.canvas_extruder = PlotCanvas(self, width=5, height=2)
+        left_layout.addWidget(self.canvas_temp)
+        left_layout.addWidget(self.canvas_motor)
+        left_layout.addWidget(self.canvas_fan)
+        left_layout.addWidget(self.canvas_extruder)
+        main_layout.addWidget(left_widget, 3)
+
+        # --- Gráfica de datos externos ---
+        self.external_data = []  # PY EXTERNO
+        self.canvas_external = PlotCanvas(self, width=5, height=2)
+        left_layout.addWidget(self.canvas_external)
+
+        # --- Panel de controles ---
+        right_widget = QWidget()
+        right_layout = QVBoxLayout(right_widget)
+
+        # Botones ON/OFF
+        self.btn_spool   = QPushButton("Motor Spool (OFF)")
+        self.btn_fan     = QPushButton("Fan (OFF)")
+        self.btn_extrude = QPushButton("Extrusor (OFF)")
+        self.btn_heater  = QPushButton("Heater (OFF)")
+        for idx, btn, name in [
+            (0, self.btn_spool,   "Motor Spool"),
+            (1, self.btn_fan,     "Fan"),
+            (2, self.btn_extrude, "Extrusor"),
+            (3, self.btn_heater,  "Heater")
+        ]:
+            btn.clicked.connect(lambda ch, i=idx, b=btn, n=name: self.toggle(i, b, n))
+            right_layout.addWidget(btn)
+
+        # Slider de velocidad de extrusor
+        self.lbl_slider = QLabel(f"Velocidad Extrusor: {self.velocidad_extrusor}")
+        self.slider     = QSlider(Qt.Horizontal)
+        self.slider.setRange(10, 100)
+        self.slider.setValue(self.velocidad_extrusor)
+        self.slider.valueChanged.connect(self.actualizar_velocidad)
+        right_layout.addWidget(self.lbl_slider)
+        right_layout.addWidget(self.slider)
+
+        # --- Slider de temperatura (NUEVO) ---
+        self.lbl_temp = QLabel(f"Temperatura objetivo: {self.temperatura_objetivo} °C")
+        self.slider_temp = QSlider(Qt.Horizontal)
+        self.slider_temp.setRange(0, 300)
+        self.slider_temp.setValue(self.temperatura_objetivo)
+        self.slider_temp.valueChanged.connect(self.actualizar_temperatura)
+        right_layout.addWidget(self.lbl_temp)
+        right_layout.addWidget(self.slider_temp)
+
+        # Botón exportar CSV
+        self.export_button = QPushButton("Exportar CSV")
+        self.export_button.clicked.connect(self.export_csv)
+        right_layout.addWidget(self.export_button)
+
+        # ----------------- Video de Extrusión -----------------
+        self.label_video = QLabel("Video de Extrusión")
+        self.label_video.setStyleSheet("font-weight: bold;")
+        right_layout.addWidget(self.label_video)
+
+        # Espacio para mostrar las imágenes de la cámara
+        self.label_camara = QLabel("Sin señal")
+        self.label_camara.setFixedSize(320, 240)
+        self.label_camara.setAlignment(Qt.AlignCenter)
+        self.label_camara.setStyleSheet("border: 2px solid gray; background-color: #111; color: white;")
+        right_layout.addWidget(self.label_camara)
+
+        # Inicializa la cámara
+        self.cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+        if not self.cap.isOpened():
+            print("⚠️ No se pudo abrir la cámara. Verifica la conexión.")
+
+        # Timer para actualizar la imagen cada segundo
+        self.timer_camara = QTimer()
+        self.timer_camara.timeout.connect(self.actualizar_imagen_camara)
+        self.timer_camara.start(500)  # cada 1000 ms (1 segundo)
+
+        main_layout.addWidget(right_widget, 1)
+
+        # Timer para refrescar gráficas
+        self.timer = QTimer()
+        self.timer.timeout.connect(self.actualizar)
+        self.timer.start(1000)  # cada 1 segundo
+
+    def _guardar_jpg(self, img_bgr, path):
+        try:
+            cv2.imwrite(path, img_bgr)
+        except Exception as e:
+            print(f"Error guardando imagen {path}: {e}")
+
+    #------------------------------------------------
+    # Cierre ordenado
+    #------------------------------------------------
+    def closeEvent(self, event):
+        """Cierra la cámara correctamente al salir."""
+        if hasattr(self, 'cap') and self.cap.isOpened():
+            self.cap.release()
+        cv2.destroyAllWindows()
+        event.accept()
+
+    def _guardar_jpg(self, img_bgr, path):
+        try:
+            cv2.imwrite(path, img_bgr)
+        except Exception as e:
+            print(f"Error guardando imagen {path}: {e}")
+
+    #------------------------------------------------
+    # Actualizar Imagenes en Interfaz
+    #------------------------------------------------
+    def actualizar_imagen_camara(self):
+        if not (hasattr(self, 'cap') and self.cap.isOpened()):
+            self.label_camara.setText("Cámara no disponible")
+            return
+
+        ok, frame = self.cap.read()
+        if not ok or frame is None:
+            self.label_camara.setText("Error al capturar imagen")
+            return
+
+        dist_mm = None  # diámetro estimado
+
+# --------------------------- Codigo de Vision -------------------------
+        try:
+            gris = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            blur = cv2.GaussianBlur(gris, (5, 5), 0)
+            _, umbral = cv2.threshold(blur, self.VALOR_UMBRAL, 255, cv2.THRESH_BINARY)
+
+            frame_resultado = cv2.cvtColor(umbral, cv2.COLOR_GRAY2BGR)
+            contornos, _ = cv2.findContours(umbral, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+            if contornos:
+                todos = np.vstack(contornos).squeeze()
+                if todos.ndim == 2 and todos.shape[0] > 3:
+                    cx = frame.shape[1] / 2.0
+                    pts_izq = todos[todos[:, 0] < cx]
+                    pts_der = todos[todos[:, 0] >= cx]
+
+                    if len(pts_izq) > 2 and len(pts_der) > 2:
+                        l_izq = cv2.fitLine(pts_izq, cv2.DIST_L2, 0, 0.01, 0.01)  # vx,vy,x0,y0
+                        l_der = cv2.fitLine(pts_der, cv2.DIST_L2, 0, 0.01, 0.01)
+
+                        # Línea izquierda
+                        vx_i, vy_i, x0_i, y0_i = [float(v) for v in l_izq.flatten()]
+                        # Línea derecha
+                        vx_d, vy_d, x0_d, y0_d = [float(v) for v in l_der.flatten()]
+
+                        # Distancia punto-recta (punto en la izquierda, recta derecha)
+                        A, B, C = vy_d, -vx_d, -vy_d * x0_d + vx_d * y0_d
+                        dist_px = abs(A * x0_i + B * y0_i + C)
+                        dist_mm = dist_px * self.FACTOR_CONVERSION
+
+                        # Dibujar líneas a lo largo de todo el ancho de la imagen
+                        h, w = frame.shape[:2]
+                        p1_i = (int(x0_i - vx_i * w), int(y0_i - vy_i * w))
+                        p2_i = (int(x0_i + vx_i * w), int(y0_i + vy_i * w))
+                        p1_d = (int(x0_d - vx_d * w), int(y0_d - vy_d * w))
+                        p2_d = (int(x0_d + vx_d * w), int(y0_d + vy_d * w))
+
+                        cv2.line(frame_resultado, p1_i, p2_i, (0, 255, 0), 2)
+                        cv2.line(frame_resultado, p1_d, p2_d, (0, 0, 255), 2)
+                        cv2.putText(frame_resultado, f"Grosor: {dist_mm:.3f} mm",
+                                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 0), 2)
+        except Exception:
+            # ante cualquier fallo del ajuste, al menos mostramos el binarizado
+            frame_resultado = cv2.cvtColor(umbral, cv2.COLOR_GRAY2BGR)
+
+# ------------------------------ CONTINUACION CAMBIOS DE MEMO ------------------------
+
+        # ---------- Despliegue de imagenes en interfaz ----------
+        vis = cv2.resize(frame_resultado, (320, 240), interpolation=cv2.INTER_AREA)
+        vis_rgb = cv2.cvtColor(vis, cv2.COLOR_BGR2RGB)
+        h, w, ch = vis_rgb.shape
+        qimg = QImage(vis_rgb.data, w, h, ch * w, QImage.Format_RGB888)
+        self.label_camara.setPixmap(QPixmap.fromImage(qimg))
+
+        # ---------- Agregar ultimo frame capturado a la carpeta ----------
+        self.buffer_frames.append(frame_resultado.copy())
+
+        # ---------- Nombrar imagenes de registro continuamente ----------
+        buffer_name = os.path.join(self.buffer_dir, f"Foto{self.buffer_index}.jpg")
+        self._guardar_jpg(frame_resultado, buffer_name)
+        self.buffer_index = 1 + (self.buffer_index % self.buffer_size)  # 1..10 circular
+
+        # ----------- Agregar imagen de anomalia si diametro de extrusion varia ----------
+        if dist_mm is not None and (dist_mm > self.DIAMETRO_MAX_MM) and (not self.anomalia_en_curso):
+            # Crear carpeta con fecha y hora
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            self.anomalia_dir = f"Anomalia_{stamp}"
+            os.makedirs(self.anomalia_dir, exist_ok=True)
+
+            # Guardar las primeras 5 fotos en existencia
+            prev_frames = list(self.buffer_frames)[-6:-1]  # 5 previas si hay
+            # Si no hay 5 imagenes, se guardan las existentes
+            n_prev = len(prev_frames)
+            start_idx = 1
+            for i, img in enumerate(prev_frames, start=start_idx):
+                self._guardar_jpg(img, os.path.join(self.anomalia_dir, f"Foto{i}.jpg"))
+
+            # Guarda la ultima foto en existencia (donde se detecta la anomalia)
+            idx_actual = n_prev + 1
+            self._guardar_jpg(frame_resultado, os.path.join(self.anomalia_dir, f"Foto{idx_actual}.jpg"))
+
+            # Guardar las siguientes 4 fotos que se tomen
+            restantes = 10 - idx_actual
+            self.anomalia_post_restantes = max(0, min(4, restantes))  # usualmente 4
+            self.anomalia_en_curso = (self.anomalia_post_restantes > 0)
+
+            # Cicla el nombramiento de imagenes
+            self._anomalia_siguiente_indice = idx_actual + 1
+
+        # Guardar fotos durante funcionamiento nominal del proceso
+        elif self.anomalia_en_curso:
+            self._guardar_jpg(
+                frame_resultado,
+                os.path.join(self.anomalia_dir, f"Foto{self._anomalia_siguiente_indice}.jpg")
+            )
+            self._anomalia_siguiente_indice += 1
+            self.anomalia_post_restantes -= 1
+            if self.anomalia_post_restantes <= 0 or self._anomalia_siguiente_indice > 10:
+                # Completamos Foto1..Foto10
+                self.anomalia_en_curso = False
+                self.anomalia_dir = None
+
+# -----------------------------------------------------------------------------------------------
+
+    #------------------------------------------------
+    # Funciones de control
+    #------------------------------------------------
+    def toggle(self, index, boton, nombre):
+        self.estado[index] = '1' if self.estado[index] == '0' else '0'
+        estado_txt = "ON" if self.estado[index] == '1' else "OFF"
+        boton.setText(f"{nombre} ({estado_txt})")
+
+    def actualizar_velocidad(self, val):
+        self.velocidad_extrusor = val
+        self.lbl_slider.setText(f"Velocidad Extrusor: {val}")
+
+    def actualizar_temperatura(self, val):
+        self.temperatura_objetivo = val
+        self.lbl_temp.setText(f"Temperatura objetivo: {val} °C")
+
+    #------------------------------------------------
+    # Loop de comunicación y gráfica
+    #------------------------------------------------
+    def actualizar(self):
+        cmd_act = "ACTUATE:" + ''.join(self.estado) + "\n"
+        arduino.write(cmd_act.encode())
+
+        cmd_vel = f"SPEED:{self.velocidad_extrusor}\n"
+        arduino.write(cmd_vel.encode())
+
+        cmd_temp = f"TEMP:{self.temperatura_objetivo}\n"
+        arduino.write(cmd_temp.encode())
+
+        while arduino.in_waiting:
+            line = arduino.readline().decode(errors='ignore').strip()
+            if line.startswith("Temp:"):
+                try:
+                    t = float(line.split(':')[1])
+                    self.temp_data.append(t)
+                except:
+                    pass
+            elif line.startswith("Motor Spool:"):
+                v = 1 if "Encendido" in line else 0
+                self.motor_data.append(v)
+            elif line.startswith("Fan:"):
+                v = 1 if "Encendido" in line else 0
+                self.fan_data.append(v)
+            elif line.startswith("Extruder:"):
+                v = 1 if "Encendido" in line else 0
+                self.extruder_data.append(v)
+
+        max_len = 100
+        self.temp_data     = self.temp_data[-max_len:]
+        self.motor_data    = self.motor_data[-max_len:]
+        self.fan_data      = self.fan_data[-max_len:]
+        self.extruder_data = self.extruder_data[-max_len:]
+
+        self.canvas_temp.plot(self.temp_data, ylabel="Temp (°C)")
+        self.canvas_motor.plot(self.motor_data, ylabel="Motor ON/OFF")
+        self.canvas_fan.plot(self.fan_data, ylabel="Fan ON/OFF")
+        self.canvas_extruder.plot(self.extruder_data, ylabel="Extrusor ON/OFF")
+        self.canvas_external.plot(self.external_data, ylabel="Datos externos")
+
+
+        # ------------------- Datos externos -------------------
+        try:
+            with open("external_data.csv", "r") as f:
+                lines = f.readlines()
+                new_data = [float(line.strip()) for line in lines if line.strip()]
+                self.external_data.extend(new_data)
+        except:
+            pass
+        self.external_data = self.external_data[-max_len:]
+        self.canvas_external.plot(self.external_data, ylabel="Datos externos")
+
+    #------------------------------------------------
+    # Exportar CSV
+    #------------------------------------------------
+    def export_csv(self):
+        path, _ = QFileDialog.getSaveFileName(self, "Guardar CSV", "data.csv", "CSV Files (*.csv)")
+        if not path:
+            return
+        import csv
+        with open(path, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(['index','Temp','Motor','Fan','Extrusor'])
+            for i in range(len(self.temp_data)):
+                m  = self.motor_data[i]    if i < len(self.motor_data)    else ''
+                f_ = self.fan_data[i]      if i < len(self.fan_data)      else ''
+                e  = self.extruder_data[i] if i < len(self.extruder_data) else ''
+                writer.writerow([i, self.temp_data[i], m, f_, e])
+        print(f"CSV guardado en {path}")
+
+# -----------------------
+# Inicio de la aplicación
+# -----------------------
+def main():
+    app = QApplication(sys.argv)
+    gui = ControlGUI()
+    gui.show()
+    sys.exit(app.exec_())
+
+if __name__ == '__main__':
+    main()
